@@ -38,14 +38,15 @@ RUN if [ -n "$CLANG_VERSION" ]; then \
 # Install CUDA if version is specified
 ARG CUDA_VERSION
 RUN if [ -n "$CUDA_VERSION" ]; then \
-    CUDA_REPO_VERSION=$(echo ${CUDA_VERSION} | sed 's/\./\-/g'); \
+    CUDA_PKG_VERSION=$(echo ${CUDA_VERSION} | cut -d'.' -f1,2 | tr '.' '-'); \
     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb && \
     dpkg -i cuda-keyring_1.0-1_all.deb && \
-    apt-get install --no-install-recommends -y cuda-toolkit-${CUDA_VERSION} && \
+    apt-get update && \
+    apt-get install --no-install-recommends -y cuda-toolkit-${CUDA_PKG_VERSION} && \
     apt-get clean -y; \
     fi
 
 # Set PATH for CUDA
 ENV PATH="/usr/local/cuda/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64"
 ENV PIP_BREAK_SYSTEM_PACKAGES=1

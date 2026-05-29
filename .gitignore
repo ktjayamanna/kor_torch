@@ -409,3 +409,6 @@ CLAUDE.local.md
 /debug_*.py
 CLAUDE_CONTEXT/
 /.claude/settings.local.json
+
+# Devcontainer generated lock files
+.devcontainer/cuda/devcontainer-lock.json
