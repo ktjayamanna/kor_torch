@@ -7,11 +7,11 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import torch
 
-from custom_contiguous import custom_contiguous
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from custom_contiguous import custom_contiguous, custom_contiguous_triton_auto
 
 
 def _sync(device: torch.device) -> None:
@@ -53,22 +53,45 @@ def run(device: torch.device, repeats: int, shape: tuple[int, int, int, int, int
     for name, x in _cases(device, shape).items():
         torch_time, torch_result = _time(lambda: x.contiguous(), device, repeats)
         custom_time, custom_result = _time(lambda: custom_contiguous(x), device, repeats)
+        triton_time = None
+        triton_result = None
+        if device.type == "cuda":
+            triton_time, triton_result = _time(
+                lambda: custom_contiguous_triton_auto(x),
+                device,
+                repeats,
+            )
 
         if torch_result.data_ptr() == x.data_ptr() or custom_result.data_ptr() == x.data_ptr():
             raise AssertionError(f"{name}: non-contiguous path returned an alias")
         torch.testing.assert_close(custom_result, torch_result, rtol=0, atol=0)
+        if triton_result is not None:
+            if triton_result.data_ptr() == x.data_ptr():
+                raise AssertionError(f"{name}: triton path returned an alias")
+            torch.testing.assert_close(triton_result, torch_result, rtol=0, atol=0)
         if custom_result.stride() != torch_result.stride():
             raise AssertionError(
                 f"{name}: stride mismatch {custom_result.stride()} != {torch_result.stride()}"
             )
+        if triton_result is not None and triton_result.stride() != torch_result.stride():
+            raise AssertionError(
+                f"{name}: triton stride mismatch {triton_result.stride()} != {torch_result.stride()}"
+            )
 
         ratio = custom_time / torch_time
-        print(
+        line = (
             f"{name:20s} "
             f"torch={torch_time * 1e3:8.3f} ms {_bandwidth_gbps(x, torch_time):8.2f} GB/s  "
-            f"custom={custom_time * 1e3:8.3f} ms {_bandwidth_gbps(x, custom_time):8.2f} GB/s  "
-            f"ratio={ratio:5.2f}x"
+            f"python={custom_time * 1e3:8.3f} ms {_bandwidth_gbps(x, custom_time):8.2f} GB/s  "
+            f"py/torch={ratio:7.2f}x"
         )
+        if triton_time is not None:
+            line += (
+                f"  triton={triton_time * 1e3:8.3f} ms "
+                f"{_bandwidth_gbps(x, triton_time):8.2f} GB/s  "
+                f"tri/torch={triton_time / torch_time:5.2f}x"
+            )
+        print(line)
 
 
 def main() -> None:

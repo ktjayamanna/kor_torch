@@ -50,6 +50,38 @@ def _contiguous_5d_kernel(
     tl.store(dst + offsets, values, mask=mask)
 
 
+@triton.jit
+def _contiguous_5d_dim0_kernel(
+    src,
+    dst,
+    d0: tl.constexpr,
+    d1: tl.constexpr,
+    d2: tl.constexpr,
+    d3: tl.constexpr,
+    d4: tl.constexpr,
+    s0: tl.constexpr,
+    s1: tl.constexpr,
+    s2: tl.constexpr,
+    s3: tl.constexpr,
+    s4: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    outer = tl.program_id(0)
+    i4 = outer % d4
+    tmp = outer // d4
+    i3 = tmp % d3
+    tmp = tmp // d3
+    i2 = tmp % d2
+    i1 = tmp // d2
+
+    i0 = tl.arange(0, block_size)
+    mask = i0 < d0
+    src_offsets = i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3 + i4 * s4
+    dst_offsets = (((i0 * d1 + i1) * d2 + i2) * d3 + i3) * d4 + i4
+    values = tl.load(src + src_offsets, mask=mask)
+    tl.store(dst + dst_offsets, values, mask=mask)
+
+
 def custom_contiguous_triton(
     x: torch.Tensor,
     block_size: int = 256,
@@ -92,3 +124,60 @@ def custom_contiguous_triton(
         block_size,
     )
     return out
+
+
+def custom_contiguous_triton_dim0(
+    x: torch.Tensor,
+    block_size: int = 256,
+) -> torch.Tensor:
+    if x.layout != torch.strided:
+        raise NotImplementedError("custom_contiguous_triton_dim0 only supports strided tensors")
+    if not x.is_cuda:
+        raise NotImplementedError("custom_contiguous_triton_dim0 only supports CUDA tensors")
+    if x.dim() != 5:
+        raise NotImplementedError("custom_contiguous_triton_dim0 only supports rank-5 tensors")
+    if x.is_contiguous():
+        return x
+
+    size = tuple(x.size())
+    out = torch.empty_strided(
+        size,
+        _contiguous_strides(size),
+        dtype=x.dtype,
+        layout=x.layout,
+        device=x.device,
+    )
+    if x.numel() == 0:
+        return out
+
+    grid = (size[1] * size[2] * size[3] * size[4],)
+    _contiguous_5d_dim0_kernel[grid](
+        x,
+        out,
+        size[0],
+        size[1],
+        size[2],
+        size[3],
+        size[4],
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        x.stride(4),
+        triton.next_power_of_2(size[0]),
+    )
+    return out
+
+
+def custom_contiguous_triton_auto(
+    x: torch.Tensor,
+    block_size: int = 256,
+) -> torch.Tensor:
+    if (
+        x.dim() == 5
+        and x.stride(0) == 1
+        and not x.is_contiguous()
+        and x.numel() >= 4 * 1024 * 1024
+    ):
+        return custom_contiguous_triton_dim0(x, block_size)
+    return custom_contiguous_triton(x, block_size)
