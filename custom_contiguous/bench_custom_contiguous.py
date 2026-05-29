@@ -40,8 +40,35 @@ def _bandwidth_gbps(x: torch.Tensor, seconds: float) -> float:
     return bytes_moved / seconds / 1e9
 
 
-def _cases(device: torch.device, shape: tuple[int, int, int, int, int]) -> dict[str, torch.Tensor]:
-    base = torch.randn(shape, device=device)
+def _dtype(name: str) -> torch.dtype:
+    dtypes = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "int32": torch.int32,
+        "uint8": torch.uint8,
+        "bool": torch.bool,
+    }
+    return dtypes[name]
+
+
+def _base_tensor(
+    shape: tuple[int, int, int, int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if dtype.is_floating_point:
+        return torch.randn(shape, device=device, dtype=dtype)
+    if dtype == torch.bool:
+        return torch.randint(0, 2, shape, device=device, dtype=dtype)
+    return torch.randint(0, 100, shape, device=device, dtype=dtype)
+
+
+def _cases(
+    device: torch.device,
+    shape: tuple[int, int, int, int, int],
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    base = _base_tensor(shape, device, dtype)
     return {
         "transpose_like": base.transpose(1, 3),
         "inner_contiguous": base.permute(1, 0, 2, 3, 4),
@@ -49,8 +76,14 @@ def _cases(device: torch.device, shape: tuple[int, int, int, int, int]) -> dict[
     }
 
 
-def run(device: torch.device, repeats: int, shape: tuple[int, int, int, int, int]) -> None:
-    for name, x in _cases(device, shape).items():
+def run(
+    device: torch.device,
+    repeats: int,
+    shape: tuple[int, int, int, int, int],
+    dtype: torch.dtype,
+) -> None:
+    print(f"shape={shape} dtype={dtype} device={device}")
+    for name, x in _cases(device, shape, dtype).items():
         torch_time, torch_result = _time(lambda: x.contiguous(), device, repeats)
         custom_time, custom_result = _time(lambda: custom_contiguous(x), device, repeats)
         triton_time = None
@@ -109,8 +142,13 @@ def main() -> None:
         default=(2, 4, 8, 16, 32),
         metavar=("D0", "D1", "D2", "D3", "D4"),
     )
+    parser.add_argument(
+        "--dtype",
+        default="float16",
+        choices=("float16", "float32", "int32", "uint8", "bool"),
+    )
     args = parser.parse_args()
-    run(torch.device(args.device), args.repeats, tuple(args.shape))
+    run(torch.device(args.device), args.repeats, tuple(args.shape), _dtype(args.dtype))
 
 
 if __name__ == "__main__":
