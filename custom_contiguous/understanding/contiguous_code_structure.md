@@ -1,308 +1,176 @@
-# How `Tensor.contiguous()` Is Structured
+# The Real Question: Why Is The Copy Fast?
 
-This note is a map for reverse engineering `tensor.contiguous()` and rebuilding
-it from first principles in `custom_contiguous/emulated`.
-
-At a high level, `.contiguous()` is not a single kernel. It is a method wrapper
-around this behavior:
-
-1. Check whether the tensor already has the requested contiguous memory format.
-2. If yes, return the same tensor object.
-3. If no, allocate a new tensor with the requested contiguous layout.
-4. Copy values from the original logical indexing order into the new layout.
-
-The core logic is small, but PyTorch routes it through generated bindings,
-ATen operator metadata, C++ Tensor wrappers, native implementation code, and
-low-level layout metadata.
-
-## End-to-End Call Path
-
-For normal Python use:
+Ignore the already-contiguous fast path for this investigation. The only part
+we care about is the forced materialization path:
 
 ```text
-x.contiguous(memory_format=torch.contiguous_format)
-  -> Python Tensor method binding
-  -> C++ Tensor::contiguous
-  -> TensorBase::contiguous fast path
-  -> aten operator dispatch: at::_ops::contiguous::call
-  -> native implementation: at::native::contiguous
-  -> clone(memory_format) if a copy is needed
+non-contiguous tensor
+  -> allocate new contiguous tensor
+  -> copy values in logical index order
+  -> return contiguous tensor
 ```
 
-Important files:
+In PyTorch this path is:
 
 ```text
-tools/autograd/templates/python_variable_methods.cpp
-aten/src/ATen/native/native_functions.yaml
-aten/src/ATen/templates/TensorBody.h
-aten/src/ATen/core/TensorBase.h
-aten/src/ATen/core/Tensor.cpp
-aten/src/ATen/native/TensorProperties.cpp
-aten/src/ATen/native/TensorFactories.cpp
-c10/core/TensorImpl.cpp
-c10/core/Contiguity.h
-torch/_refs/__init__.py
+aten/src/ATen/native/TensorProperties.cpp::contiguous
+  -> self.clone(memory_format)
+  -> aten/src/ATen/native/TensorFactories.cpp::clone
+  -> allocate destination
+  -> self.copy_(src)
 ```
 
-## Python Binding Layer
-
-File:
-
-```text
-tools/autograd/templates/python_variable_methods.cpp
-```
-
-Key function:
-
-```cpp
-THPVariable_contiguous
-```
-
-This is the Python-facing `torch.Tensor.contiguous` method. It:
-
-- parses the optional `memory_format` keyword,
-- handles `__torch_function__`,
-- unwraps the Python object into an ATen `Tensor`,
-- checks if the tensor is already contiguous,
-- returns `self` directly for the fast path,
-- otherwise calls `self.contiguous(memory_format)`.
-
-This file is a template used by PyTorch code generation, so the final built
-binding is generated from it.
-
-## Operator Schema
-
-File:
-
-```text
-aten/src/ATen/native/native_functions.yaml
-```
-
-Schema:
-
-```yaml
-- func: contiguous(Tensor(a) self, *, MemoryFormat memory_format=contiguous_format) -> Tensor(a)
-  variants: method
-  manual_cpp_binding: True
-```
-
-This declares the ATen operator. The important details are:
-
-- `variants: method` means it exists as a tensor method.
-- `manual_cpp_binding: True` means the C++ method binding is hand-written
-  instead of only generated.
-- The alias annotation `Tensor(a) -> Tensor(a)` allows returning the same
-  tensor when no copy is needed.
-
-## C++ Tensor Method Layer
-
-Files:
-
-```text
-aten/src/ATen/templates/TensorBody.h
-aten/src/ATen/core/TensorBase.h
-aten/src/ATen/core/Tensor.cpp
-```
-
-`TensorBody.h` exposes:
-
-```cpp
-Tensor contiguous(MemoryFormat memory_format=MemoryFormat::Contiguous) const
-```
-
-That forwards to `TensorBase::contiguous`.
-
-`TensorBase::contiguous` contains an important fast path:
-
-```cpp
-if (is_contiguous_or_false(memory_format)) {
-  return *this;
-} else {
-  return __dispatch_contiguous(memory_format);
-}
-```
-
-`Tensor.cpp` defines the slow path dispatch:
-
-```cpp
-TensorBase TensorBase::__dispatch_contiguous(c10::MemoryFormat memory_format) const {
-  OptionalTensorRef self(*this);
-  return at::_ops::contiguous::call(*self, memory_format);
-}
-```
-
-For an emulation, this layer can be reduced to:
-
-```text
-if already_contiguous(tensor, memory_format):
-    return tensor
-return contiguous_copy(tensor, memory_format)
-```
-
-## Native Implementation
-
-File:
-
-```text
-aten/src/ATen/native/TensorProperties.cpp
-```
-
-Core implementation:
+The core implementation is tiny:
 
 ```cpp
 Tensor contiguous(const Tensor& self, MemoryFormat memory_format) {
-  if (self.is_contiguous_or_false(memory_format)) {
-    return self;
-  }
-  TORCH_CHECK(
-      memory_format != MemoryFormat::Preserve,
-      "preserve memory format is unsupported by the contiguous operator");
-
   return self.clone(memory_format);
 }
 ```
 
-This is the main behavior to rebuild. The only real work happens inside:
+after excluding the fast-path check and error handling.
 
-- `is_contiguous_or_false(memory_format)`
-- `clone(memory_format)`
+## What Must Happen
 
-`MemoryFormat::Preserve` is explicitly rejected for `.contiguous()`, even
-though `clone()` itself can accept preserve-format semantics.
-
-## Contiguity Predicate
-
-Files:
+For a dense rank-5 tensor, contiguous copy has to do this:
 
 ```text
-c10/core/TensorImpl.cpp
-c10/core/Contiguity.h
+shape:      [D0, D1, D2, D3, D4]
+src stride: [S0, S1, S2, S3, S4]
+dst stride: [D1*D2*D3*D4, D2*D3*D4, D3*D4, D4, 1]
 ```
 
-For default row-major contiguous layout, the key rule is in
-`c10/core/Contiguity.h`:
-
-```cpp
-expected_stride = 1
-for d from last dimension to first dimension:
-    if size[d] == 1:
-        continue
-    if stride[d] != expected_stride:
-        return false
-    expected_stride *= size[d]
-return true
-```
-
-Important behavior:
-
-- A tensor with `numel == 0` is considered contiguous.
-- Dimensions of size `1` do not constrain stride.
-- Sparse tensors return false from the dense contiguity computation.
-- Channels-last and channels-last-3d have separate stride rules.
-
-For a first emulation, start with default contiguous format only:
+For every logical index:
 
 ```text
-sizes   = tensor shape
-strides = tensor strides
-numel   = product(sizes)
+i0, i1, i2, i3, i4
 ```
 
-Then implement the algorithm above.
-
-## Copy Path Through `clone`
-
-Files:
+read:
 
 ```text
-aten/src/ATen/native/native_functions.yaml
+src[src_offset + i0*S0 + i1*S1 + i2*S2 + i3*S3 + i4*S4]
+```
+
+write:
+
+```text
+dst[((((i0*D1 + i1)*D2 + i2)*D3 + i3)*D4 + i4)]
+```
+
+That is the whole problem.
+
+## What Makes It Fast
+
+The copy is fast when PyTorch avoids treating it like arbitrary 5D indexing for
+every element.
+
+The speed comes from:
+
+1. Destination writes are contiguous.
+2. Adjacent dimensions can often be collapsed into larger linear runs.
+3. Inner loops can become simple pointer increments.
+4. Copy kernels are compiled, vectorized, and parallelized.
+5. CPU copies can use cache-friendly loops and multiple threads.
+6. CUDA copies can use coalesced writes and many threads.
+7. Allocation comes from PyTorch's allocator, not repeated per-element growth.
+
+The important enemy is per-element index math:
+
+```text
+offset = i0*S0 + i1*S1 + i2*S2 + i3*S3 + i4*S4
+```
+
+If that calculation happens naively for 1B elements in Python, the emulator
+cannot match PyTorch. If the loop is compiled and dimensions are collapsed, the
+work becomes close to a memory-bandwidth problem.
+
+## First-Principles Copy Model
+
+Start with the dumb truth:
+
+```python
+for i0 in range(D0):
+  for i1 in range(D1):
+    for i2 in range(D2):
+      for i3 in range(D3):
+        for i4 in range(D4):
+          dst[k] = src[base + i0*S0 + i1*S1 + i2*S2 + i3*S3 + i4*S4]
+          k += 1
+```
+
+Then optimize by asking:
+
+```text
+Which dimensions are already contiguous in source order?
+Can the innermost loop copy a full contiguous run?
+Can several dimensions collapse into one loop?
+Can the outer loops only compute a base pointer once per block?
+Can the inner loop become memcpy or vectorized loads/stores?
+```
+
+Example: if the last dimension is contiguous in source:
+
+```text
+S4 == 1
+```
+
+then the innermost loop reads and writes contiguous memory. That is much faster
+than a fully strided gather.
+
+If more dimensions match contiguous layout:
+
+```text
+S3 == D4
+S2 == D3*D4
+S1 == D2*D3*D4
+```
+
+then those dimensions can collapse into larger linear copies.
+
+## Experiment Target
+
+Use a dense rank-5 `float32` tensor.
+
+Benchmark cases:
+
+1. Simple transpose-like non-contiguous layout.
+2. Permuted layout where the last logical dimension is still source-contiguous.
+3. Layout where the innermost logical dimension is badly strided.
+
+For each case compare:
+
+```text
+torch_result = x.contiguous()
+emulated_result = custom_contiguous(x)
+```
+
+Measure:
+
+```text
+bytes_moved = input_bytes + output_bytes
+bandwidth = bytes_moved / seconds
+```
+
+Matching PyTorch means matching effective bandwidth, not just returning the
+right values.
+
+## Files To Read
+
+Only these matter for this question:
+
+```text
+aten/src/ATen/native/TensorProperties.cpp
 aten/src/ATen/native/TensorFactories.cpp
 aten/src/ATen/native/Copy.cpp
+aten/src/ATen/native/cpu/CopyKernel.cpp
+aten/src/ATen/native/cuda/Copy.cu
 ```
 
-`contiguous()` uses:
-
-```cpp
-self.clone(memory_format)
-```
-
-The dense clone implementation does roughly:
+The investigation should move downward from:
 
 ```text
-memory_format = requested format or Preserve
-allocate output tensor with that layout
-copy src values into output
-return output
+contiguous -> clone -> copy_ -> backend copy kernel
 ```
 
-For default contiguous format, rebuilding this means:
-
-1. Compute contiguous strides for the same shape.
-2. Allocate storage of `numel` elements.
-3. Iterate over logical indices of the source tensor.
-4. Read from source using source strides and source storage offset.
-5. Write into destination using contiguous strides.
-
-## Python Reference Implementation
-
-File:
-
-```text
-torch/_refs/__init__.py
-```
-
-Function:
-
-```python
-def contiguous(a, *, memory_format=torch.contiguous_format):
-    ...
-```
-
-This is useful as a readable model. It rejects `torch.preserve_format`, checks
-contiguity with `is_contiguous_for_memory_format_or_false`, and otherwise calls
-`torch.clone(a, memory_format=memory_format)`.
-
-For emulation, this Python reference is easier to mirror than the generated
-C++ binding path.
-
-## What To Rebuild First
-
-Suggested order for `custom_contiguous/emulated`:
-
-1. A small tensor metadata object with `sizes`, `strides`, `storage_offset`,
-   and flat `storage`.
-2. `numel(sizes)`.
-3. `default_contiguous_strides(sizes)`.
-4. `is_default_contiguous(sizes, strides, numel)`.
-5. Logical-index iteration over an N-dimensional shape.
-6. `clone_default_contiguous(tensor)`.
-7. `custom_contiguous(tensor)`:
-
-```python
-def custom_contiguous(t):
-    if is_default_contiguous(t.sizes, t.strides, t.numel()):
-        return t
-    return clone_default_contiguous(t)
-```
-
-After that works, extend toward:
-
-- `memory_format=torch.channels_last`
-- `memory_format=torch.channels_last_3d`
-- size-1 dimension stride edge cases
-- zero-numel tensors
-- aliasing behavior when returning `self`
-
-## Minimal Behavior Contract
-
-For default `.contiguous()`:
-
-- If the input is already contiguous, return the same logical tensor.
-- If the input is not contiguous, return a new tensor.
-- The new tensor has the same shape and values.
-- The new tensor has default row-major contiguous strides.
-- Logical values are preserved, storage layout is changed.
-- `preserve_format` is not valid for `.contiguous()`.
-
-This is the core contract to emulate before worrying about PyTorch dispatch,
-autograd, devices, dtypes, sparse tensors, quantized tensors, or named tensors.
+That backend copy kernel is where the speed truth lives.
